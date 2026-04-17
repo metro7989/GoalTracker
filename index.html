@@ -1,0 +1,801 @@
+```react
+import React, { useState, useEffect, useCallback } from 'react';
+import { 
+  Droplet, Moon, Activity, Apple, BookOpen, 
+  Settings, Bell, X, Check, Plus, Minus, 
+  ChevronLeft, ChevronRight, Cloud, CloudOff, 
+  Loader2, Camera, Trash2, UserCircle
+} from 'lucide-react';
+
+// --- Firebase Setup ---
+import { initializeApp } from 'firebase/app';
+import { getAuth, signInWithCustomToken, signInAnonymously, onAuthStateChanged } from 'firebase/auth';
+import { getFirestore, doc, setDoc, onSnapshot } from 'firebase/firestore';
+
+const firebaseConfig = typeof __firebase_config !== 'undefined' ? JSON.parse(__firebase_config) : {};
+const app = initializeApp(firebaseConfig);
+const auth = getAuth(app);
+const db = getFirestore(app);
+const appId = typeof __app_id !== 'undefined' ? __app_id : 'default-app-id';
+
+// --- Reusable UI Components ---
+const Card = ({ children, className = "" }) => (
+  <div className={`bg-white rounded-2xl p-6 shadow-sm border border-gray-100 ${className}`}>
+    {children}
+  </div>
+);
+
+const IconButton = ({ onClick, icon: Icon, disabled = false, className = "" }) => (
+  <button 
+    onClick={onClick}
+    disabled={disabled}
+    className={`p-2 rounded-full flex items-center justify-center transition-colors
+      ${disabled ? 'opacity-50 cursor-not-allowed text-gray-300' : 'hover:bg-gray-100 text-gray-700 active:bg-gray-200'}
+      ${className}`}
+  >
+    <Icon size={20} />
+  </button>
+);
+
+const PhotoUploader = ({ photoData, onUpload, onDelete, label, captureMode = "environment", placeholder = "Tap to capture or upload" }) => (
+  <div className="mt-4">
+    <label className="text-xs text-slate-500 font-semibold uppercase tracking-wider mb-2 block">{label}</label>
+    {photoData ? (
+      <div className="relative rounded-xl overflow-hidden group border border-slate-200 shadow-sm">
+        <img src={photoData} alt={label} className="w-full h-48 md:h-64 object-cover" />
+        <button
+          onClick={onDelete}
+          className="absolute top-3 right-3 p-2 bg-rose-500 text-white rounded-full opacity-100 md:opacity-0 md:group-hover:opacity-100 transition-opacity shadow-md hover:bg-rose-600"
+        >
+          <Trash2 size={16} />
+        </button>
+      </div>
+    ) : (
+      <label className="cursor-pointer flex flex-col items-center justify-center w-full h-32 md:h-40 bg-slate-50 border-2 border-dashed border-slate-300 rounded-xl hover:bg-slate-100 hover:border-indigo-400 transition-all group">
+        <div className="p-3 bg-white rounded-full shadow-sm mb-3 group-hover:scale-110 transition-transform">
+          <Camera className="text-indigo-500" size={24} />
+        </div>
+        <span className="text-sm font-medium text-slate-500">{placeholder}</span>
+        <input
+          type="file"
+          accept="image/*"
+          capture={captureMode} // 'user' for front camera, 'environment' for back camera
+          onChange={onUpload}
+          className="hidden"
+        />
+      </label>
+    )}
+  </div>
+);
+
+// --- Default Data Structure ---
+const defaultData = {
+  water: { current: 0, goal: 8 },
+  sleep: { current: 0, goal: 8 },
+  exercise: { duration: 0, goal: 45, type: '', completed: false },
+  nutrition: { score: 3, meals: { breakfast: false, lunch: false, dinner: false, snacks: false }, notes: '', photo: null },
+  journal: '',
+  progressPhoto: null
+};
+
+const defaultSettings = {
+  water: { active: false, intervalMin: 60, lastTriggered: null },
+  move: { active: false, intervalMin: 60, lastTriggered: null }
+};
+
+// --- Main Application ---
+export default function App() {
+  // --- Auth & Sync State ---
+  const [user, setUser] = useState(null);
+  const [loading, setLoading] = useState(true);
+  const [syncStatus, setSyncStatus] = useState('syncing');
+
+  // --- App State ---
+  const [date, setDate] = useState(new Date());
+  const [dailyData, setDailyData] = useState(defaultData);
+  const [settings, setSettings] = useState(defaultSettings);
+  const [showSettings, setShowSettings] = useState(false);
+  const [toasts, setToasts] = useState([]);
+
+  // Local state for debounced inputs
+  const [localJournal, setLocalJournal] = useState('');
+  const [localNotes, setLocalNotes] = useState('');
+  const [localExerciseType, setLocalExerciseType] = useState('');
+
+  // --- Helpers ---
+  const getLocalYYYYMMDD = (d) => {
+    const year = d.getFullYear();
+    const month = String(d.getMonth() + 1).padStart(2, '0');
+    const day = String(d.getDate()).padStart(2, '0');
+    return `${year}-${month}-${day}`;
+  };
+  const dateStr = getLocalYYYYMMDD(date);
+
+  const addToast = useCallback((title, message, type = 'info') => {
+    const id = Date.now() + Math.random();
+    setToasts(prev => [...prev, { id, title, message, type }]);
+    setTimeout(() => setToasts(prev => prev.filter(t => t.id !== id)), 5000);
+  }, []);
+
+  const removeToast = (id) => setToasts(prev => prev.filter(t => t.id !== id));
+
+  const changeDate = (days) => {
+    const newDate = new Date(date);
+    newDate.setDate(newDate.getDate() + days);
+    setDate(newDate);
+  };
+
+  const isToday = dateStr === getLocalYYYYMMDD(new Date());
+
+  // --- Image Processing (Compression) ---
+  // Compresses image heavily to easily fit within Firestore document limits (<1MB)
+  const processImage = (file, callback) => {
+    if (!file) return;
+    const reader = new FileReader();
+    reader.onload = (event) => {
+      const img = new Image();
+      img.onload = () => {
+        const canvas = document.createElement('canvas');
+        const MAX_WIDTH = 600;
+        const MAX_HEIGHT = 600;
+        let width = img.width;
+        let height = img.height;
+
+        if (width > height) {
+          if (width > MAX_WIDTH) {
+            height *= MAX_WIDTH / width;
+            width = MAX_WIDTH;
+          }
+        } else {
+          if (height > MAX_HEIGHT) {
+            width *= MAX_HEIGHT / height;
+            height = MAX_HEIGHT;
+          }
+        }
+        canvas.width = width;
+        canvas.height = height;
+        const ctx = canvas.getContext('2d');
+        ctx.drawImage(img, 0, 0, width, height);
+        // Compress to 60% quality JPEG (typically results in 20-50kb)
+        const compressedBase64 = canvas.toDataURL('image/jpeg', 0.6);
+        callback(compressedBase64);
+      };
+      img.src = event.target.result;
+    };
+    reader.readAsDataURL(file);
+  };
+
+  // --- Database Interactions ---
+
+  useEffect(() => {
+    const initAuth = async () => {
+      try {
+        if (typeof __initial_auth_token !== 'undefined' && __initial_auth_token) {
+          await signInWithCustomToken(auth, __initial_auth_token);
+        } else {
+          await signInAnonymously(auth);
+        }
+      } catch (err) {
+        console.error("Auth failed:", err);
+      }
+    };
+    initAuth();
+    const unsubscribe = onAuthStateChanged(auth, setUser);
+    return () => unsubscribe();
+  }, []);
+
+  useEffect(() => {
+    if (!user) return;
+    
+    setLoading(true);
+    setSyncStatus('syncing');
+    
+    const docRef = doc(db, 'artifacts', appId, 'users', user.uid, 'habit_logs', dateStr);
+    const unsubscribe = onSnapshot(docRef, 
+      (snapshot) => {
+        if (snapshot.exists()) {
+          const data = snapshot.data();
+          setDailyData({ ...defaultData, ...data });
+          setLocalJournal(data.journal || '');
+          setLocalNotes(data.nutrition?.notes || '');
+          setLocalExerciseType(data.exercise?.type || '');
+        } else {
+          setDailyData(defaultData);
+          setLocalJournal('');
+          setLocalNotes('');
+          setLocalExerciseType('');
+        }
+        setLoading(false);
+        setSyncStatus('synced');
+      }, 
+      (error) => {
+        console.error("Error fetching data:", error);
+        setSyncStatus('error');
+        setLoading(false);
+      }
+    );
+
+    return () => unsubscribe();
+  }, [user, dateStr]);
+
+  useEffect(() => {
+    if (!user) return;
+    const settingsRef = doc(db, 'artifacts', appId, 'users', user.uid, 'settings', 'preferences');
+    const unsubscribe = onSnapshot(settingsRef, (snapshot) => {
+      if (snapshot.exists()) {
+        setSettings({ ...defaultSettings, ...snapshot.data() });
+      }
+    }, (err) => console.error(err));
+    return () => unsubscribe();
+  }, [user]);
+
+  const updateField = async (field, value) => {
+    setDailyData(prev => ({ ...prev, [field]: value }));
+    if (!user) return;
+    setSyncStatus('syncing');
+    try {
+      const docRef = doc(db, 'artifacts', appId, 'users', user.uid, 'habit_logs', dateStr);
+      await setDoc(docRef, { [field]: value }, { merge: true });
+      setSyncStatus('synced');
+    } catch (err) {
+      console.error("Error saving data:", err);
+      setSyncStatus('error');
+    }
+  };
+
+  const updateSettings = async (updates) => {
+    setSettings(prev => ({ ...prev, ...updates }));
+    if (!user) return;
+    try {
+      const settingsRef = doc(db, 'artifacts', appId, 'users', user.uid, 'settings', 'preferences');
+      await setDoc(settingsRef, updates, { merge: true });
+    } catch (err) {
+      console.error(err);
+    }
+  };
+
+  // --- Handlers for Photos ---
+  const handleMealPhotoUpload = (e) => {
+    processImage(e.target.files[0], (base64) => {
+      updateField('nutrition', { ...dailyData.nutrition, photo: base64 });
+    });
+  };
+
+  const handleMealPhotoDelete = () => {
+    updateField('nutrition', { ...dailyData.nutrition, photo: null });
+  };
+
+  const handleProgressPhotoUpload = (e) => {
+    processImage(e.target.files[0], (base64) => {
+      updateField('progressPhoto', base64);
+    });
+  };
+
+  const handleProgressPhotoDelete = () => {
+    updateField('progressPhoto', null);
+  };
+
+  // --- Reminder Engine ---
+  useEffect(() => {
+    const checkReminders = () => {
+      const now = Date.now();
+      let updated = false;
+      const nextSettings = { ...settings };
+
+      if (settings.water.active) {
+        const last = settings.water.lastTriggered || now;
+        if (now - last >= settings.water.intervalMin * 60000) {
+          addToast("Hydration Time!", "It's time to drink a glass of water.", "water");
+          nextSettings.water.lastTriggered = now;
+          updated = true;
+        } else if (!settings.water.lastTriggered) {
+          nextSettings.water.lastTriggered = now;
+          updated = true;
+        }
+      }
+
+      if (settings.move.active) {
+        const last = settings.move.lastTriggered || now;
+        if (now - last >= settings.move.intervalMin * 60000) {
+          addToast("Time to Move!", "Stand up, stretch, and move around a bit.", "move");
+          nextSettings.move.lastTriggered = now;
+          updated = true;
+        } else if (!settings.move.lastTriggered) {
+          nextSettings.move.lastTriggered = now;
+          updated = true;
+        }
+      }
+
+      if (updated) {
+        setSettings(nextSettings);
+      }
+    };
+
+    const intervalId = setInterval(checkReminders, 10000);
+    return () => clearInterval(intervalId);
+  }, [settings, addToast]);
+
+  // --- Render Helpers ---
+  const formatDate = (d) => {
+    return new Intl.DateTimeFormat('en-US', { weekday: 'short', month: 'short', day: 'numeric' }).format(d);
+  };
+
+  const getDayProgress = () => {
+    let score = 0;
+    let max = 4;
+    if (dailyData.water.current >= dailyData.water.goal) score++;
+    if (dailyData.sleep.current >= dailyData.sleep.goal) score++;
+    if (dailyData.exercise.completed || dailyData.exercise.duration >= dailyData.exercise.goal) score++;
+    if (dailyData.nutrition.score >= 4) score++;
+    return Math.round((score / max) * 100);
+  };
+
+  return (
+    <div className="min-h-screen bg-slate-50 font-sans text-slate-800 selection:bg-indigo-100 selection:text-indigo-900 pb-20">
+      
+      {/* Header */}
+      <header className="bg-white border-b border-gray-200 sticky top-0 z-30 shadow-sm">
+        <div className="max-w-5xl mx-auto px-4 sm:px-6 lg:px-8 h-16 flex items-center justify-between">
+          <div className="flex items-center gap-3">
+            <div className="w-10 h-10 bg-indigo-600 rounded-xl flex items-center justify-center text-white shadow-md shadow-indigo-200">
+              <Activity size={24} />
+            </div>
+            <div className="hidden sm:block">
+              <h1 className="text-xl font-bold text-slate-900 leading-tight">Daily Vitality</h1>
+              <div className="flex items-center gap-1 text-xs text-slate-500 font-medium">
+                {syncStatus === 'synced' ? <Cloud size={12} className="text-green-500" /> : 
+                 syncStatus === 'syncing' ? <Loader2 size={12} className="animate-spin" /> : 
+                 <CloudOff size={12} className="text-red-500" />}
+                {syncStatus === 'synced' ? 'Cloud Sync Active' : syncStatus === 'syncing' ? 'Saving...' : 'Offline'}
+              </div>
+            </div>
+          </div>
+
+          <div className="flex items-center bg-slate-100 rounded-full p-1 border border-slate-200">
+            <IconButton onClick={() => changeDate(-1)} icon={ChevronLeft} className="w-8 h-8" />
+            <div className="w-28 sm:w-32 text-center font-semibold text-sm">
+              {isToday ? "Today" : formatDate(date)}
+            </div>
+            <IconButton onClick={() => changeDate(1)} icon={ChevronRight} className="w-8 h-8" disabled={isToday} />
+          </div>
+
+          <button 
+            onClick={() => setShowSettings(true)}
+            className="p-2 text-slate-500 hover:text-indigo-600 hover:bg-indigo-50 rounded-full transition-colors"
+          >
+            <Settings size={22} />
+          </button>
+        </div>
+      </header>
+
+      <main className="max-w-5xl mx-auto px-4 sm:px-6 lg:px-8 py-8 space-y-6">
+        
+        {loading ? (
+          <div className="flex flex-col items-center justify-center py-20 text-slate-400">
+            <Loader2 size={40} className="animate-spin mb-4 text-indigo-500" />
+            <p>Loading your habit data...</p>
+          </div>
+        ) : (
+          <>
+            {/* Top Overview Section */}
+            <section className="bg-gradient-to-br from-indigo-600 to-violet-700 rounded-3xl p-6 md:p-8 text-white shadow-lg shadow-indigo-200 relative overflow-hidden">
+              <div className="grid grid-cols-1 md:grid-cols-2 gap-8 items-center relative z-10">
+                <div>
+                  <h2 className="text-2xl md:text-3xl font-bold mb-2">
+                    {isToday ? "Great job today!" : `Reviewing ${formatDate(date)}`}
+                  </h2>
+                  <p className="text-indigo-100 mb-6 max-w-md text-sm md:text-base leading-relaxed">
+                    {isToday 
+                      ? "Consistency is key. You're making excellent progress on your daily wellness goals. Keep up the momentum!" 
+                      : "Looking back at your progress helps build long-term habits. Check out how you did on this day."}
+                  </p>
+                  
+                  <div className="bg-white/10 rounded-2xl p-4 backdrop-blur-sm border border-white/20">
+                    <div className="flex justify-between items-center mb-2">
+                      <span className="font-semibold text-sm">Daily Master Goal</span>
+                      <span className="font-bold">{getDayProgress()}%</span>
+                    </div>
+                    <div className="h-2 w-full bg-black/20 rounded-full overflow-hidden">
+                      <div 
+                        className="h-full bg-white rounded-full transition-all duration-700 ease-out" 
+                        style={{ width: `${getDayProgress()}%` }}
+                      />
+                    </div>
+                  </div>
+                </div>
+                
+                <div className="hidden md:grid grid-cols-2 gap-4">
+                  <div className="bg-white/10 p-4 rounded-2xl border border-white/10 backdrop-blur-sm flex flex-col items-center justify-center text-center">
+                      <Droplet className="text-blue-300 mb-2" />
+                      <span className="text-2xl font-bold">{dailyData.water.current}</span>
+                      <span className="text-xs text-indigo-100 uppercase tracking-wider">Water</span>
+                  </div>
+                  <div className="bg-white/10 p-4 rounded-2xl border border-white/10 backdrop-blur-sm flex flex-col items-center justify-center text-center">
+                      <Moon className="text-purple-300 mb-2" />
+                      <span className="text-2xl font-bold">{dailyData.sleep.current}h</span>
+                      <span className="text-xs text-indigo-100 uppercase tracking-wider">Sleep</span>
+                  </div>
+                </div>
+              </div>
+            </section>
+
+            {/* Trackers Grid */}
+            <div className="grid grid-cols-1 md:grid-cols-2 gap-6">
+              
+              {/* Nutrition & Meals Tracker (Expanded for Photo) */}
+              <Card className="md:col-span-2">
+                <div className="flex items-center justify-between mb-6">
+                  <div className="flex items-center gap-3">
+                    <div className="p-3 bg-green-50 text-green-600 rounded-xl">
+                      <Apple size={24} />
+                    </div>
+                    <h3 className="font-bold text-lg">Nutrition & Meals</h3>
+                  </div>
+                </div>
+
+                <div className="grid grid-cols-1 md:grid-cols-2 lg:grid-cols-3 gap-8">
+                  {/* Column 1: Checklists */}
+                  <div>
+                    <h4 className="text-sm font-semibold text-slate-700 mb-3 uppercase tracking-wider">Meals Logged</h4>
+                    <div className="space-y-3">
+                      {Object.entries(dailyData.nutrition.meals).map(([meal, isLogged]) => (
+                        <label key={meal} className="flex items-center gap-3 p-3 rounded-xl border border-slate-100 hover:bg-slate-50 cursor-pointer transition-colors">
+                          <div className={`w-6 h-6 rounded-md flex items-center justify-center transition-colors ${isLogged ? 'bg-green-500 text-white' : 'bg-slate-100 border border-slate-200 text-transparent'}`}>
+                            <Check size={16} strokeWidth={3} />
+                          </div>
+                          <input 
+                            type="checkbox" 
+                            checked={isLogged} 
+                            onChange={() => updateField('nutrition', { 
+                              ...dailyData.nutrition, 
+                              meals: { ...dailyData.nutrition.meals, [meal]: !isLogged } 
+                            })}
+                            className="hidden" 
+                          />
+                          <span className="capitalize font-medium text-slate-700">{meal}</span>
+                        </label>
+                      ))}
+                    </div>
+                  </div>
+
+                  {/* Column 2: Rating & Notes */}
+                  <div>
+                    <h4 className="text-sm font-semibold text-slate-700 mb-3 uppercase tracking-wider">How did you eat?</h4>
+                    <div className="flex justify-between mb-6 bg-slate-50 p-2 rounded-2xl">
+                      {[1, 2, 3, 4, 5].map((rating) => (
+                        <button
+                          key={rating}
+                          onClick={() => updateField('nutrition', { ...dailyData.nutrition, score: rating })}
+                          className={`w-10 h-10 sm:w-12 sm:h-12 rounded-xl flex items-center justify-center text-xl transition-all
+                            ${dailyData.nutrition.score === rating 
+                              ? 'bg-white shadow-sm border border-slate-200 scale-110' 
+                              : 'hover:bg-slate-100 opacity-50 grayscale hover:grayscale-0'}`}
+                        >
+                          {rating === 1 ? '🤢' : rating === 2 ? '😕' : rating === 3 ? '😐' : rating === 4 ? '🙂' : '🥗'}
+                        </button>
+                      ))}
+                    </div>
+                    <textarea 
+                      placeholder="Diet notes (e.g., cravings, feeling bloated, ate veggies)"
+                      value={localNotes}
+                      onChange={(e) => setLocalNotes(e.target.value)}
+                      onBlur={() => updateField('nutrition', { ...dailyData.nutrition, notes: localNotes })}
+                      className="w-full p-3 rounded-xl border border-slate-200 focus:ring-2 focus:ring-green-500 focus:border-transparent outline-none resize-none h-24 text-sm"
+                    />
+                  </div>
+
+                  {/* Column 3: Meal Photo */}
+                  <div className="lg:col-span-1 md:col-span-2">
+                    <PhotoUploader 
+                      photoData={dailyData.nutrition.photo}
+                      onUpload={handleMealPhotoUpload}
+                      onDelete={handleMealPhotoDelete}
+                      label="Meal Highlight Photo"
+                      captureMode="environment"
+                      placeholder="Snap a pic of a meal"
+                    />
+                  </div>
+                </div>
+              </Card>
+
+              {/* Water Tracker */}
+              <Card className="flex flex-col">
+                <div className="flex items-center justify-between mb-6">
+                  <div className="flex items-center gap-3">
+                    <div className="p-3 bg-blue-50 text-blue-600 rounded-xl">
+                      <Droplet size={24} />
+                    </div>
+                    <h3 className="font-bold text-lg">Hydration</h3>
+                  </div>
+                  <span className="text-sm font-medium text-slate-500">Goal: {dailyData.water.goal}</span>
+                </div>
+                
+                <div className="flex-grow flex flex-col items-center justify-center py-4">
+                  <div className="text-5xl font-black text-slate-800 mb-2 tracking-tight">
+                    {dailyData.water.current}
+                    <span className="text-xl text-slate-400 font-medium ml-1">/ {dailyData.water.goal}</span>
+                  </div>
+                  <p className="text-slate-500 text-sm mb-6">glasses of water</p>
+                  
+                  <div className="flex items-center gap-4">
+                    <button 
+                      onClick={() => updateField('water', { ...dailyData.water, current: Math.max(0, dailyData.water.current - 1) })}
+                      className="w-12 h-12 rounded-full border-2 border-slate-200 flex items-center justify-center text-slate-600 hover:bg-slate-50 hover:border-slate-300 transition-all active:scale-95"
+                    >
+                      <Minus size={20} />
+                    </button>
+                    
+                    <div className="flex gap-1">
+                      {[...Array(Math.min(5, dailyData.water.goal))].map((_, i) => (
+                        <div 
+                          key={i} 
+                          className={`w-3 h-8 rounded-full transition-all duration-300 ${i < dailyData.water.current ? 'bg-blue-500' : 'bg-slate-100'}`} 
+                        />
+                      ))}
+                    </div>
+
+                    <button 
+                      onClick={() => updateField('water', { ...dailyData.water, current: dailyData.water.current + 1 })}
+                      className="w-12 h-12 rounded-full bg-blue-500 text-white flex items-center justify-center shadow-lg shadow-blue-200 hover:bg-blue-600 transition-all active:scale-95"
+                    >
+                      <Plus size={24} />
+                    </button>
+                  </div>
+                </div>
+                
+                <div className="mt-4">
+                  <div className="h-2 w-full bg-slate-100 rounded-full overflow-hidden">
+                    <div 
+                      className="h-full bg-blue-500 rounded-full transition-all duration-500" 
+                      style={{ width: `${Math.min(100, (dailyData.water.current / dailyData.water.goal) * 100)}%` }}
+                    />
+                  </div>
+                </div>
+              </Card>
+
+              {/* Sleep Tracker */}
+              <Card>
+                <div className="flex items-center justify-between mb-6">
+                  <div className="flex items-center gap-3">
+                    <div className="p-3 bg-purple-50 text-purple-600 rounded-xl">
+                      <Moon size={24} />
+                    </div>
+                    <h3 className="font-bold text-lg">Sleep</h3>
+                  </div>
+                </div>
+                
+                <div className="py-4">
+                  <div className="flex items-baseline justify-center gap-2 mb-6 text-center">
+                    <span className="text-5xl font-black text-slate-800 tracking-tight">{dailyData.sleep.current}</span>
+                    <span className="text-slate-500 font-medium">hours</span>
+                  </div>
+                  
+                  <input 
+                    type="range" 
+                    min="0" 
+                    max="12" 
+                    step="0.5"
+                    value={dailyData.sleep.current}
+                    onChange={(e) => updateField('sleep', { ...dailyData.sleep, current: parseFloat(e.target.value) })}
+                    className="w-full h-2 bg-slate-200 rounded-lg appearance-none cursor-pointer accent-purple-600"
+                  />
+                  <div className="flex justify-between text-xs text-slate-400 mt-2 font-medium">
+                    <span>0h</span>
+                    <span>Goal: {dailyData.sleep.goal}h</span>
+                    <span>12h+</span>
+                  </div>
+                </div>
+              </Card>
+
+              {/* Exercise Tracker */}
+              <Card>
+                <div className="flex items-center justify-between mb-6">
+                  <div className="flex items-center gap-3">
+                    <div className="p-3 bg-orange-50 text-orange-600 rounded-xl">
+                      <Activity size={24} />
+                    </div>
+                    <h3 className="font-bold text-lg">Movement</h3>
+                  </div>
+                  <button 
+                    onClick={() => updateField('exercise', { ...dailyData.exercise, completed: !dailyData.exercise.completed })}
+                    className={`flex items-center gap-1 text-sm font-medium px-3 py-1.5 rounded-full transition-colors ${
+                      dailyData.exercise.completed ? 'bg-orange-100 text-orange-700' : 'bg-slate-100 text-slate-600 hover:bg-slate-200'
+                    }`}
+                  >
+                    {dailyData.exercise.completed ? <Check size={16} /> : <div className="w-4 h-4 rounded-full border-2 border-slate-400" />}
+                    {dailyData.exercise.completed ? 'Completed' : 'Mark Done'}
+                  </button>
+                </div>
+                
+                <div className="space-y-4">
+                  <div>
+                    <label className="text-xs text-slate-500 font-semibold uppercase tracking-wider mb-1 block">Activity Type</label>
+                    <input 
+                      type="text" 
+                      value={localExerciseType}
+                      onChange={(e) => setLocalExerciseType(e.target.value)}
+                      onBlur={() => updateField('exercise', { ...dailyData.exercise, type: localExerciseType })}
+                      placeholder="e.g., Walking, Yoga, Gym"
+                      className="w-full p-3 bg-slate-50 border border-slate-200 rounded-xl focus:ring-2 focus:ring-orange-500 outline-none font-medium"
+                    />
+                  </div>
+                  <div>
+                    <label className="text-xs text-slate-500 font-semibold uppercase tracking-wider mb-1 block">Duration (Minutes)</label>
+                    <div className="flex items-center gap-4">
+                       <input 
+                        type="number" 
+                        value={dailyData.exercise.duration}
+                        onChange={(e) => updateField('exercise', { ...dailyData.exercise, duration: parseInt(e.target.value) || 0 })}
+                        className="w-full p-3 bg-slate-50 border border-slate-200 rounded-xl focus:ring-2 focus:ring-orange-500 outline-none font-medium"
+                      />
+                      <span className="text-sm font-medium text-slate-400 whitespace-nowrap">/ {dailyData.exercise.goal} min</span>
+                    </div>
+                  </div>
+                </div>
+              </Card>
+
+              {/* Progress Selfie */}
+              <Card>
+                 <div className="flex items-center justify-between mb-2">
+                  <div className="flex items-center gap-3">
+                    <div className="p-3 bg-indigo-50 text-indigo-600 rounded-xl">
+                      <UserCircle size={24} />
+                    </div>
+                    <h3 className="font-bold text-lg">Progress Selfie</h3>
+                  </div>
+                </div>
+                <PhotoUploader 
+                  photoData={dailyData.progressPhoto}
+                  onUpload={handleProgressPhotoUpload}
+                  onDelete={handleProgressPhotoDelete}
+                  label="Daily check-in photo"
+                  captureMode="user" // Defaults to front camera
+                  placeholder="Take a selfie"
+                />
+              </Card>
+
+              {/* Journal Section */}
+              <Card className="md:col-span-2">
+                <div className="flex items-center justify-between mb-6">
+                  <div className="flex items-center gap-3">
+                    <div className="p-3 bg-rose-50 text-rose-600 rounded-xl">
+                      <BookOpen size={24} />
+                    </div>
+                    <h3 className="font-bold text-lg">Daily Journal</h3>
+                  </div>
+                </div>
+                
+                <textarea 
+                  value={localJournal}
+                  onChange={(e) => setLocalJournal(e.target.value)}
+                  onBlur={() => updateField('journal', localJournal)}
+                  placeholder="How are you feeling today? Any wins or challenges you want to note?"
+                  className="w-full p-4 bg-slate-50 border border-slate-200 rounded-xl h-40 focus:ring-2 focus:ring-rose-500 focus:border-transparent outline-none resize-none leading-relaxed"
+                />
+              </Card>
+            </div>
+          </>
+        )}
+      </main>
+
+      {/* --- Settings / Reminders Modal --- */}
+      {showSettings && (
+        <div className="fixed inset-0 bg-slate-900/40 backdrop-blur-sm z-50 flex items-center justify-center p-4 z-50">
+          <div className="bg-white rounded-3xl w-full max-w-md shadow-2xl overflow-hidden animate-in fade-in zoom-in-95 duration-200">
+            <div className="flex justify-between items-center p-6 border-b border-slate-100">
+              <h2 className="text-xl font-bold flex items-center gap-2">
+                <Bell className="text-indigo-600" /> Reminders & Settings
+              </h2>
+              <IconButton onClick={() => setShowSettings(false)} icon={X} />
+            </div>
+            
+            <div className="p-6 space-y-6">
+              <p className="text-sm text-slate-500 mb-2">Reminders sync securely to your profile and work while the app is open.</p>
+              
+              {/* Water Reminder Settings */}
+              <div className="bg-slate-50 p-4 rounded-2xl border border-slate-100">
+                <div className="flex items-center justify-between mb-4">
+                  <div className="flex items-center gap-3">
+                    <div className="p-2 bg-blue-100 text-blue-600 rounded-lg"><Droplet size={20} /></div>
+                    <span className="font-semibold text-slate-800">Drink Water</span>
+                  </div>
+                  <label className="relative inline-flex items-center cursor-pointer">
+                    <input 
+                      type="checkbox" 
+                      className="sr-only peer"
+                      checked={settings.water.active}
+                      onChange={(e) => updateSettings({ water: { ...settings.water, active: e.target.checked } })}
+                    />
+                    <div className="w-11 h-6 bg-slate-200 peer-focus:outline-none rounded-full peer peer-checked:after:translate-x-full peer-checked:after:border-white after:content-[''] after:absolute after:top-[2px] after:left-[2px] after:bg-white after:border-gray-300 after:border after:rounded-full after:h-5 after:w-5 after:transition-all peer-checked:bg-blue-500"></div>
+                  </label>
+                </div>
+                <div className="flex items-center justify-between text-sm">
+                  <span className="text-slate-600">Notify me every:</span>
+                  <select 
+                    disabled={!settings.water.active}
+                    value={settings.water.intervalMin}
+                    onChange={(e) => updateSettings({ water: { ...settings.water, intervalMin: Number(e.target.value) } })}
+                    className="p-2 border border-slate-200 rounded-lg bg-white outline-none disabled:opacity-50"
+                  >
+                    <option value={30}>30 mins</option>
+                    <option value={60}>1 hour</option>
+                    <option value={120}>2 hours</option>
+                  </select>
+                </div>
+              </div>
+
+              {/* Move Reminder Settings */}
+              <div className="bg-slate-50 p-4 rounded-2xl border border-slate-100">
+                <div className="flex items-center justify-between mb-4">
+                  <div className="flex items-center gap-3">
+                    <div className="p-2 bg-orange-100 text-orange-600 rounded-lg"><Activity size={20} /></div>
+                    <span className="font-semibold text-slate-800">Stand & Move</span>
+                  </div>
+                  <label className="relative inline-flex items-center cursor-pointer">
+                    <input 
+                      type="checkbox" 
+                      className="sr-only peer"
+                      checked={settings.move.active}
+                      onChange={(e) => updateSettings({ move: { ...settings.move, active: e.target.checked } })}
+                    />
+                    <div className="w-11 h-6 bg-slate-200 peer-focus:outline-none rounded-full peer peer-checked:after:translate-x-full peer-checked:after:border-white after:content-[''] after:absolute after:top-[2px] after:left-[2px] after:bg-white after:border-gray-300 after:border after:rounded-full after:h-5 after:w-5 after:transition-all peer-checked:bg-orange-500"></div>
+                  </label>
+                </div>
+                <div className="flex items-center justify-between text-sm">
+                  <span className="text-slate-600">Notify me every:</span>
+                  <select 
+                    disabled={!settings.move.active}
+                    value={settings.move.intervalMin}
+                    onChange={(e) => updateSettings({ move: { ...settings.move, intervalMin: Number(e.target.value) } })}
+                    className="p-2 border border-slate-200 rounded-lg bg-white outline-none disabled:opacity-50"
+                  >
+                    <option value={30}>30 mins</option>
+                    <option value={60}>1 hour</option>
+                    <option value={120}>2 hours</option>
+                  </select>
+                </div>
+              </div>
+
+            </div>
+            
+            <div className="p-6 border-t border-slate-100 bg-slate-50">
+              <button 
+                onClick={() => setShowSettings(false)}
+                className="w-full py-3 bg-indigo-600 text-white rounded-xl font-semibold hover:bg-indigo-700 transition-colors shadow-sm"
+              >
+                Save & Close
+              </button>
+            </div>
+          </div>
+        </div>
+      )}
+
+      {/* --- Custom In-App Toasts (Reminders) --- */}
+      <div className="fixed bottom-6 right-6 z-50 flex flex-col gap-3 pointer-events-none">
+        {toasts.map(toast => (
+          <div 
+            key={toast.id} 
+            className="pointer-events-auto bg-white rounded-2xl p-4 shadow-xl shadow-slate-200/50 border border-slate-100 flex items-start gap-4 animate-in slide-in-from-right-8 fade-in duration-300 min-w-[300px]"
+          >
+            <div className={`p-2 rounded-xl mt-0.5
+              ${toast.type === 'water' ? 'bg-blue-100 text-blue-600' : 'bg-orange-100 text-orange-600'}
+            `}>
+              {toast.type === 'water' ? <Droplet size={20} /> : <Activity size={20} />}
+            </div>
+            <div className="flex-grow">
+              <h4 className="font-bold text-slate-800 text-sm">{toast.title}</h4>
+              <p className="text-slate-500 text-sm mt-0.5 leading-snug">{toast.message}</p>
+            </div>
+            <button onClick={() => removeToast(toast.id)} className="text-slate-400 hover:text-slate-600">
+              <X size={16} />
+            </button>
+          </div>
+        ))}
+      </div>
+
+    </div>
+  );
+}
+
+
+```
